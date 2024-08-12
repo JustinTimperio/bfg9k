@@ -9,13 +9,13 @@ import (
 	"fmt"
 	"image/png"
 	"os"
-	"reflect"
 	"sort"
 	"sync"
+	"time"
 
-	"github.com/at-wat/ebml-go"
 	"github.com/auyer/steganography"
 	"github.com/peterbourgon/ff/v3"
+	"gocv.io/x/gocv"
 )
 
 func main() {
@@ -29,8 +29,9 @@ func main() {
 		victimImage   = fs.String("victim", "", "victim png or mkv")
 		outputFile    = fs.String("output", "", "output file")
 		encryptionKey = fs.String("key", "", "encryption key")
-		chunkSize     = fs.Int("chunk", 400*1024, "chunk size")
+		chunkSize     = fs.Int("chunk", 750*1024, "chunk size")
 		cores         = fs.Int("cores", 32, "number of cores to use")
+		truncate      = fs.Bool("truncate", false, "truncate the output video when all data is encoded")
 	)
 
 	err := ff.Parse(fs, os.Args[1:])
@@ -85,6 +86,7 @@ func main() {
 			fmt.Println("Invalid function! Use encrypt or decrypt")
 			os.Exit(1)
 		}
+
 	case "mkv":
 		switch *function {
 		case "encrypt":
@@ -93,7 +95,7 @@ func main() {
 				os.Exit(1)
 			}
 
-			err := encryptFileToMKV(*inputFile, *victimImage, *outputFile, []byte(*encryptionKey), *chunkSize, *cores)
+			err := encryptFileToMKV(*inputFile, *victimImage, *outputFile, []byte(*encryptionKey), *chunkSize, *cores, *truncate)
 			if err != nil {
 				fmt.Println(err)
 				os.Exit(1)
@@ -115,20 +117,25 @@ func main() {
 	return
 }
 
-func encryptFileToMKV(inputFile, inputMKV, outputFile string, key []byte, chunkSize int, cores int) error {
+type eFrame struct {
+	data     gocv.Mat
+	position int
+}
+
+func encryptFileToMKV(inputFile, inputMKV, outputFile string, key []byte, chunkSize int, cores int, truncate bool) error {
 	// Read the input file
 	content, err := os.ReadFile(inputFile)
 	if err != nil {
 		return err
 	}
 
-	fmt.Println("Size of the content:", common.HumanFileSize(int64(len(content))))
-
 	// Encrypt the content
 	edata, err := encryption.Encrypt(key, content)
 	if err != nil {
 		return err
 	}
+
+	fmt.Println("Size of the encrypted data:", common.HumanFileSize(int64(len(edata))), "MD5:", common.MD5Hash(edata))
 
 	var chunks [][]byte
 	for i := 0; i < len(edata); i += chunkSize {
@@ -139,288 +146,276 @@ func encryptFileToMKV(inputFile, inputMKV, outputFile string, key []byte, chunkS
 		chunks = append(chunks, edata[i:end])
 	}
 
-	iMKV, err := os.Open(inputMKV)
+	// Void the original data
+	edata = nil
+
+	inputVideo, err := gocv.VideoCaptureFile(inputMKV)
 	if err != nil {
 		return err
 	}
+	defer inputVideo.Close()
 
-	// Create a new image
-	var dmkv = make(map[string]any)
+	if len(chunks) > int(inputVideo.Get(gocv.VideoCaptureFrameCount)) {
+		return fmt.Errorf("Not enough frames to encode the data. Can support up to %s", common.HumanFileSize(int64(inputVideo.Get(gocv.VideoCaptureFrameCount)*float64(chunkSize))))
+	} else {
+		fmt.Println("Video can support up to", common.HumanFileSize(int64(inputVideo.Get(gocv.VideoCaptureFrameCount)*float64(chunkSize))), "of data")
+	}
 
-	err = ebml.Unmarshal(iMKV, &dmkv)
+	outputVideo, err := gocv.VideoWriterFile(
+		outputFile,
+		"MPNG",
+		inputVideo.Get(gocv.VideoCaptureFPS),
+		int(inputVideo.Get(gocv.VideoCaptureFrameWidth)),
+		int(inputVideo.Get(gocv.VideoCaptureFrameHeight)),
+		true,
+	)
+
 	if err != nil {
 		return err
 	}
+	defer outputVideo.Close()
 
-	var count int
-	for _, x := range dmkv["Segment"].(map[string]any)["Cluster"].([]any) {
-		for _, y := range x.(map[string]any) {
-			_, ok := y.([]any)
+	var (
+		currentFrame      int
+		extraFrames       int
+		doneSendingFrames bool
+		encodingPosition  int
+		mux               sync.Mutex
+		wg                sync.WaitGroup
+		sem               = common.NewSemaphore(cores)
+		frames            = make(map[int]eFrame)
+	)
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	doneChan := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		for {
+			mux.Lock()
+			frame, ok := frames[encodingPosition]
 			if !ok {
+				mux.Unlock()
+				if doneSendingFrames {
+					break
+				}
+				time.Sleep(1 * time.Second)
 				continue
 			}
-			for _, z := range y.([]any) {
-				b, ok := z.(ebml.Block)
-				if !ok {
-					continue
-				}
-				if !b.Keyframe {
-					continue
-				}
-				if b.TrackNumber != 1 {
-					continue
-				}
+			delete(frames, encodingPosition)
 
-				count++
-			}
+			outputVideo.Write(frame.data)
+			encodingPosition++
+			mux.Unlock()
 		}
-	}
+	}()
 
-	if count < len(chunks) {
-		return fmt.Errorf("Not enough clusters in the MKV file Real: %d Needed: %d, Max Available Size: %s", count, len(chunks), common.HumanFileSize(int64(count*chunkSize)))
-	} else {
-		fmt.Println("Enough clusters in the MKV file Real:", count, "Needed:", len(chunks), "Max Available Size:", common.HumanFileSize(int64(count*chunkSize)))
-	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
 
-	type newFrame struct {
-		frame   []byte
-		cluster int
-		block   int
-	}
-
-	var counter int64
-	var newFrames []newFrame
-	var shouldBreak bool
-	var mux sync.Mutex
-	var wg sync.WaitGroup
-	var sem = common.NewSemaphore(cores)
-
-	for c, x := range dmkv["Segment"].(map[string]any)["Cluster"].([]any) {
-
-		for s, y := range x.(map[string]any)["SimpleBlock"].([]any) {
-
-			if counter >= int64(len(chunks)) {
-				shouldBreak = true
+		var internalWG sync.WaitGroup
+		for {
+			frame := gocv.NewMat()
+			if !inputVideo.Read(&frame) {
+				doneSendingFrames = true
 				break
 			}
 
-			b, ok := y.(ebml.Block)
-			if !ok {
-				continue
-			}
-			if !b.Keyframe {
-				continue
-			}
-			if b.TrackNumber != 1 {
+			if currentFrame >= len(chunks) {
+				if truncate {
+					doneSendingFrames = true
+					break
+				}
+
+				// If we have reached the end of the data, just write the remaining frames
+				mux.Lock()
+				frames[currentFrame+extraFrames] = eFrame{data: frame, position: currentFrame}
+				mux.Unlock()
+				extraFrames++
 				continue
 			}
 
-			wg.Add(1)
+			// Only stay ahead of the encoding position by 64 frames
+			// Otherwise we blow up the memory usage
+			for {
+				if currentFrame-encodingPosition < 64 {
+					break
+				}
+				time.Sleep(1 * time.Second)
+			}
+
 			sem.Acquire()
-			go func(counter int64) {
+			internalWG.Add(1)
+			go func(frameNum int, frame gocv.Mat) {
 				defer sem.Release()
-				defer wg.Done()
+				defer internalWG.Done()
 
-				img, err := png.Decode(bytes.NewReader(b.Data[0]))
+				buf, err := gocv.IMEncodeWithParams(".png", frame, []int{gocv.IMWritePngCompression, 0})
 				if err != nil {
-					fmt.Println("Error decoding the image:", err)
+					fmt.Println("Error encoding frame:", err)
 					return
+				}
+
+				pngImage, err := png.Decode(bytes.NewReader(buf.GetBytes()))
+				if err != nil {
+					fmt.Println("Error decoding frame:", err)
+					return
+				}
+
+				maxSize := steganography.MaxEncodeSize(pngImage)
+				if maxSize < uint32(chunkSize) {
+					panic("Chunk size is larger than the maximum size that can be encoded in the image")
 				}
 
 				// Encode the encrypted data into the image
-				var buf = bytes.NewBuffer(nil)
-				err = steganography.Encode(buf, img, chunks[counter])
+				newImage := bytes.NewBuffer(nil)
+				err = steganography.Encode(newImage, pngImage, chunks[frameNum])
 				if err != nil {
-					fmt.Println("Error encoding the data into the image:", err)
+					fmt.Println("Error encoding data:", err)
 					return
 				}
 
-				f := newFrame{
-					frame:   buf.Bytes(),
-					cluster: c,
-					block:   s,
+				frame, err = gocv.IMDecode(newImage.Bytes(), gocv.IMReadColor)
+				if err != nil {
+					fmt.Println("Error decoding frame:", err)
+					return
 				}
 
 				mux.Lock()
-				newFrames = append(newFrames, f)
+				frames[frameNum] = eFrame{data: frame, position: frameNum}
 				mux.Unlock()
 
-			}(counter)
+			}(currentFrame, frame)
 
-			fmt.Printf("\rProgress: %d / %d", counter, len(chunks))
-			counter++
+			currentFrame++
 		}
 
-		if shouldBreak {
-			break
+		internalWG.Wait()
+	}()
+
+	go func() {
+		wg.Wait()
+		doneChan <- struct{}{}
+		close(doneChan)
+	}()
+
+forLoop:
+	for {
+		select {
+		case <-ticker.C:
+			fmt.Printf("\rEncoding data into video | Generation: %d/%d | Encoding: %d/%d", currentFrame, len(chunks), encodingPosition, int(inputVideo.Get(gocv.VideoCaptureFrameCount)))
+		case <-doneChan:
+			fmt.Println("\nEncoding data into video: Done")
+			break forLoop
 		}
 	}
 
-	wg.Wait()
-	fmt.Println("\nDone encoding", counter, "chunks")
-
-	// Update the map with the new frames
-	for i, f := range newFrames {
-		dmkv["Segment"].(map[string]any)["Cluster"].([]any)[f.cluster].(map[string]any)["SimpleBlock"].([]any)[f.block].(ebml.Block).Data[0] = f.frame
-		fmt.Printf("\rUpdated frame: %d / %d", i, len(newFrames))
+	if currentFrame < len(chunks) {
+		return fmt.Errorf("\nNot enough frames to encode the data")
 	}
-
-	fmt.Println("\nMarshalling the MKV file")
-
-	os.Remove(outputFile)
-	outFile, err := os.Create(outputFile)
-	if err != nil {
-		return err
-	}
-	defer outFile.Close()
-
-	err = ebml.Marshal(&dmkv, outFile)
-	if err != nil {
-		return fmt.Errorf("Error marshalling the MKV file: %v", err)
-	}
-	fmt.Println("Done marshalling the MKV file")
 
 	return nil
 }
 
+type dFrame struct {
+	data     []byte
+	position int
+}
+
 func decryptMKVToFile(inputMKV, outputFile string, key []byte, chunkSize int, cores int) error {
 
-	iMKV, err := os.Open(inputMKV)
+	inputVideo, err := gocv.VideoCaptureFile(inputMKV)
 	if err != nil {
 		return err
 	}
+	defer inputVideo.Close()
 
-	// Create a new image
-	var dmkv = make(map[string]any)
+	var (
+		frames    []dFrame
+		sem       = common.NewSemaphore(cores)
+		wg        sync.WaitGroup
+		mux       sync.Mutex
+		counter   int
+		lastFrame bool
+	)
 
-	err = ebml.Unmarshal(iMKV, &dmkv)
-	if err != nil {
-		return err
-	}
-
-	var count int
-	for _, x := range dmkv["Segment"].(map[string]any)["Cluster"].([]any) {
-		for _, y := range x.(map[string]any) {
-			_, ok := y.([]any)
-			if !ok {
-				continue
-			}
-			for _, z := range y.([]any) {
-				b, ok := z.(ebml.Block)
-				if !ok {
-					continue
-				}
-				if !b.Keyframe {
-					continue
-				}
-				if b.TrackNumber != 1 {
-					continue
-				}
-
-				count++
-			}
-		}
-	}
-
-	type frame struct {
-		frame []byte
-		order int
-	}
-
-	var frames []frame
-	var shouldBreak bool
-	var hasStarted bool
-	var counter int
-	var sem = common.NewSemaphore(cores)
-	var wg sync.WaitGroup
-	var mux sync.Mutex
-
-	for _, x := range dmkv["Segment"].(map[string]any)["Cluster"].([]any) {
-		for _, y := range x.(map[string]any)["SimpleBlock"].([]any) {
-
-			if shouldBreak {
-				break
-			}
-
-			b, ok := y.(ebml.Block)
-			if !ok {
-				fmt.Println("Not a block", reflect.TypeOf(y))
-				continue
-			}
-
-			if !b.Keyframe {
-				continue
-			}
-			if b.TrackNumber != 1 {
-				continue
-			}
-			counter++
-
-			wg.Add(1)
-			sem.Acquire()
-			go func(counter int) {
-				defer sem.Release()
-				defer wg.Done()
-
-				// Decode the data from the image
-				image := bytes.NewBuffer(b.Data[0])
-				i, err := png.Decode(image)
-				if err != nil {
-					return
-				}
-
-				block := steganography.Decode(steganography.GetMessageSizeFromImage(i), i)
-
-				// If the block is less than or equal to chunk size, then we can assume that it's the correct block
-				if len(block) <= chunkSize {
-					hasStarted = true
-
-					f := frame{
-						frame: block,
-						order: counter,
-					}
-					mux.Lock()
-					frames = append(frames, f)
-					mux.Unlock()
-					fmt.Printf("\rProgress: %d Out of %d Potential Frames", counter, count)
-				} else if hasStarted {
-					shouldBreak = true
-				}
-			}(counter)
-
-			if shouldBreak {
-				break
-			}
-		}
-
-		if shouldBreak {
+	for {
+		frame := gocv.NewMat()
+		if !inputVideo.Read(&frame) {
 			break
 		}
+
+		if lastFrame {
+			break
+		}
+
+		wg.Add(1)
+		sem.Acquire()
+		go func(frameNum int, frame gocv.Mat) {
+			defer sem.Release()
+			defer wg.Done()
+
+			buf, err := gocv.IMEncodeWithParams(".png", frame, []int{gocv.IMWritePngCompression, 0})
+			if err != nil {
+				fmt.Println("Error encoding frame:", err)
+				return
+			}
+
+			pngImage, err := png.Decode(bytes.NewReader(buf.GetBytes()))
+			if err != nil {
+				fmt.Println("Error decoding frame:", err)
+				return
+			}
+
+			data := steganography.Decode(steganography.GetMessageSizeFromImage(pngImage), pngImage)
+			if len(data) <= chunkSize && len(data) > 200 {
+				if len(data) == 0 {
+					return
+				}
+				if len(data) < chunkSize {
+					lastFrame = true
+				}
+				mux.Lock()
+				frames = append(frames, dFrame{data: data, position: frameNum})
+				mux.Unlock()
+				return
+			}
+
+			return
+
+		}(counter, frame)
+
+		fmt.Printf("\rDecoding data from video | Frame: %d/%d", counter, int(inputVideo.Get(gocv.VideoCaptureFrameCount)))
+
+		counter++
 	}
 
 	wg.Wait()
-	fmt.Println("\nDone decoding", counter, "frames")
 
-	fmt.Println("Sorting the frames and decrypting the data")
+	if len(frames) == 0 {
+		return fmt.Errorf("No data found in the video")
+	}
+
 	sort.Slice(frames, func(i, j int) bool {
-		return frames[i].order < frames[j].order
+		return frames[i].position < frames[j].position
 	})
 
 	// Decrypt the data
 	var data []byte
 	for _, f := range frames {
-		if len(f.frame) == 0 || f.frame == nil {
-			continue
-		}
-		data = append(data, f.frame...)
+		data = append(data, f.data...)
 	}
+
+	fmt.Println("\nSize of decoded data:", common.HumanFileSize(int64(len(data))), "MD5:", common.MD5Hash(data))
 
 	data, err = encryption.Decrypt(key, data)
 	if err != nil {
 		return err
 	}
-
-	fmt.Println("Decrypted data size:", common.HumanFileSize(int64(len(data))))
 
 	// Write the decrypted data to the output file
 	err = os.WriteFile(outputFile, data, 0644)

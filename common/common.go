@@ -1,6 +1,8 @@
 package common
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"io"
 	"math"
 	"strconv"
@@ -101,4 +103,9 @@ func ZstdCompressReader(in io.Reader, out io.Writer) error {
 		return err
 	}
 	return enc.Close()
+}
+
+func MD5Hash(data []byte) (hash string) {
+	h := md5.Sum(data)
+	return hex.EncodeToString(h[:])
 }

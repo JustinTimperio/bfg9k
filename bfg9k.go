@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/auyer/steganography"
+	"github.com/klauspost/reedsolomon"
 	"github.com/peterbourgon/ff/v3"
 	"gocv.io/x/gocv"
 )
@@ -134,20 +135,42 @@ func encryptFileToMKV(inputFile, inputMKV, outputFile string, key []byte, chunkS
 	if err != nil {
 		return err
 	}
+	fmt.Println("Size of encrypted data:", common.HumanFileSize(int64(len(edata))), "| MD5 Hash:", common.MD5Hash(edata))
 
-	fmt.Println("Size of the encrypted data:", common.HumanFileSize(int64(len(edata))), "MD5:", common.MD5Hash(edata))
-
-	var chunks [][]byte
-	for i := 0; i < len(edata); i += chunkSize {
-		end := i + chunkSize
-		if end > len(edata) {
-			end = len(edata)
-		}
-		chunks = append(chunks, edata[i:end])
+	enc, err := reedsolomon.New(100, 25)
+	if err != nil {
+		return err
 	}
 
-	// Void the original data
-	edata = nil
+	ecShards, err := enc.Split(edata)
+	if err != nil {
+		return err
+	}
+
+	err = enc.Encode(ecShards)
+	if err != nil {
+		return err
+	}
+
+	// Calculate the size of the data
+	var size int
+	var parityBytes []byte
+	for _, shard := range ecShards {
+		parityBytes = append(parityBytes, shard...)
+		size += len(shard)
+	}
+
+	fmt.Println("Size of encoded data:", common.HumanFileSize(int64(size)), "| MD5:", common.MD5Hash(parityBytes))
+
+	// Disassemble the data into shards in our chunk size
+	var chunks [][]byte
+	for i := 0; i < len(parityBytes); i += chunkSize {
+		end := i + chunkSize
+		if end > len(parityBytes) {
+			end = len(parityBytes)
+		}
+		chunks = append(chunks, parityBytes[i:end])
+	}
 
 	inputVideo, err := gocv.VideoCaptureFile(inputMKV)
 	if err != nil {
@@ -355,6 +378,7 @@ func decryptMKVToFile(inputMKV, outputFile string, key []byte, chunkSize int, co
 
 		wg.Add(1)
 		sem.Acquire()
+
 		go func(frameNum int, frame gocv.Mat) {
 			defer sem.Release()
 			defer wg.Done()
@@ -372,10 +396,7 @@ func decryptMKVToFile(inputMKV, outputFile string, key []byte, chunkSize int, co
 			}
 
 			data := steganography.Decode(steganography.GetMessageSizeFromImage(pngImage), pngImage)
-			if len(data) <= chunkSize && len(data) > 200 {
-				if len(data) == 0 {
-					return
-				}
+			if len(data) <= chunkSize {
 				if len(data) < chunkSize {
 					lastFrame = true
 				}
@@ -404,15 +425,71 @@ func decryptMKVToFile(inputMKV, outputFile string, key []byte, chunkSize int, co
 		return frames[i].position < frames[j].position
 	})
 
-	// Decrypt the data
-	var data []byte
-	for _, f := range frames {
-		data = append(data, f.data...)
+	var chunks []byte
+	for _, frame := range frames {
+		chunks = append(chunks, frame.data...)
 	}
 
-	fmt.Println("\nSize of decoded data:", common.HumanFileSize(int64(len(data))), "MD5:", common.MD5Hash(data))
+	fmt.Println("\nSize of encoded data:", common.HumanFileSize(int64(len(chunks))), "MD5:", common.MD5Hash(chunks))
 
-	data, err = encryption.Decrypt(key, data)
+	var ecShards = make([][]byte, 125)
+	var shardSize = len(chunks) / 125
+	for i := range ecShards {
+		start := i * shardSize
+		end := start + shardSize
+		if start+shardSize > len(chunks) {
+			end = len(chunks)
+		}
+
+		ecShards[i] = chunks[start:end]
+	}
+
+	// Create a Reed-Solomon decoder
+	dec, err := reedsolomon.New(100, 25)
+	if err != nil {
+		return fmt.Errorf("Error creating Reed-Solomon decoder: %v", err)
+	}
+
+	// Verify the parity
+	ok, err := dec.Verify(ecShards)
+	if err != nil {
+		return fmt.Errorf("Error verifying parity: %v", err)
+	}
+	if !ok {
+		err = dec.Reconstruct(ecShards)
+		if err != nil {
+			return fmt.Errorf("Error reconstructing parity: %v", err)
+		}
+
+		ok, err = dec.Verify(ecShards)
+		if err != nil {
+			return fmt.Errorf("Error verifying parity after reconstruction: %v", err)
+		}
+		if !ok {
+			return fmt.Errorf("Parity check failed a second time")
+		}
+	}
+
+	// Join the shards into a single data slice
+	var buf bytes.Buffer
+	err = dec.Join(&buf, ecShards, (100 * shardSize))
+	if err != nil {
+		return err
+	}
+
+	// Trim the zeros from the end of the data
+	// TODO: This may cause failures if the data ends with zeros
+	for i := len(buf.Bytes()) - 1; i >= 0; i-- {
+		if buf.Bytes()[i] == 0 {
+			buf.Truncate(i)
+		} else {
+			break
+		}
+	}
+
+	fmt.Println("Size of decoded data:", common.HumanFileSize(int64(len(buf.Bytes()))), "MD5:", common.MD5Hash(buf.Bytes()))
+
+	data, err := encryption.Decrypt(key, buf.Bytes())
 	if err != nil {
 		return err
 	}

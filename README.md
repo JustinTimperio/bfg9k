@@ -4,7 +4,7 @@
 
 # BFG-9k
 
-BFG-9k is a easy to use encrypted steganography tool that can be used to embed files into into images and video. The tool currently supports embedding files into PNG and MKV files encoded with the PNG codec. It uses AES encryption to encrypt the file before embedding it into the target file. In the case you are encoding a file into a MKV file, the file is stored in the image data across the video frames in chunks. You may need to change the chunk size depending on the size of the stream you are embedding into.
+BFG-9k is a easy to use encrypted steganography tool that can be used to embed files into into images and video. The tool currently supports embedding files into PNG and MKV files encoded with the PNG codec. It uses AES encryption to encrypt the file before embedding it into the target file. It also utilizes the Reed-Solomon error-correcting format to ensure that data can still be recovered in the event of lost bits or corruption. In the case you are encoding a file into a MKV file, the file is stored in the image data across the video frames in chunks. You may need to change the chunk size depending on the size of the stream you are embedding into.
 
 ```sh
 ❯ ./bfg9k -h

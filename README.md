@@ -10,7 +10,9 @@ BFG-9k is a easy to use encrypted steganography tool that can be used to embed f
 ❯ ./bfg9k -h
 Usage of bfg9k:
   -chunk int
-        chunk size (default 409600)
+        chunk size (default 768000)
+  -cores int
+        number of cores to use (default 32)
   -function string
         encrypt or decrypt
   -input string
@@ -19,12 +21,16 @@ Usage of bfg9k:
         encryption key
   -output string
         output file
+  -replicas int
+        number of parity shards to use for Reed-Solomon encoding (default 25)
+  -shards int
+        number of shards to use for Reed-Solomon encoding (default 100)
+  -truncate
+        truncate the output video when all data is encoded
   -type string
         png or mkv
   -victim string
-        victim png or mkv 
-  -cores int
-        number of cores to use (default 32)
+        victim png or mkv
 ```
 
 ## Installation
@@ -43,7 +49,7 @@ sudo pacman -S ffmpeg opencv vtk glew go
 ## MKV Steganography 
 
 ### Encoding
-Embedding a file into a MKV container is a simple process, but the main consideration is that the mkv must be encoded with the lossless png codec. This is because the file is stored in the image data of the video frames. 
+Embedding a file into a MKV container is a simple process, but the main consideration is that the exported mkv will be encoded with the lossless png codec. This is because the file is stored in the image data of the video frames. 
 
 This can be done with the following command:
 ```sh

@@ -33,11 +33,18 @@ func main() {
 		chunkSize     = fs.Int("chunk", 750*1024, "chunk size")
 		cores         = fs.Int("cores", 32, "number of cores to use")
 		truncate      = fs.Bool("truncate", false, "truncate the output video when all data is encoded")
+		shards        = fs.Int("shards", 100, "number of shards to use for Reed-Solomon encoding")
+		parity        = fs.Int("replicas", 25, "number of parity shards to use for Reed-Solomon encoding")
 	)
 
 	err := ff.Parse(fs, os.Args[1:])
 	if err != nil {
 		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	if *shards+*parity > 255 {
+		fmt.Println("Shards and replicas must be less than 255 in total")
 		os.Exit(1)
 	}
 
@@ -96,14 +103,14 @@ func main() {
 				os.Exit(1)
 			}
 
-			err := encryptFileToMKV(*inputFile, *victimImage, *outputFile, []byte(*encryptionKey), *chunkSize, *cores, *truncate)
+			err := encryptFileToMKV(*inputFile, *victimImage, *outputFile, []byte(*encryptionKey), *chunkSize, *cores, *truncate, *shards, *parity)
 			if err != nil {
 				fmt.Println(err)
 				os.Exit(1)
 			}
 
 		case "decrypt":
-			err := decryptMKVToFile(*inputFile, *outputFile, []byte(*encryptionKey), *chunkSize, *cores)
+			err := decryptMKVToFile(*inputFile, *outputFile, []byte(*encryptionKey), *chunkSize, *cores, *shards, *parity)
 			if err != nil {
 				fmt.Println(err)
 				os.Exit(1)
@@ -123,7 +130,7 @@ type eFrame struct {
 	position int
 }
 
-func encryptFileToMKV(inputFile, inputMKV, outputFile string, key []byte, chunkSize int, cores int, truncate bool) error {
+func encryptFileToMKV(inputFile, inputMKV, outputFile string, key []byte, chunkSize int, cores int, truncate bool, shards, parity int) error {
 	// Read the input file
 	content, err := os.ReadFile(inputFile)
 	if err != nil {
@@ -137,7 +144,7 @@ func encryptFileToMKV(inputFile, inputMKV, outputFile string, key []byte, chunkS
 	}
 	fmt.Println("Size of encrypted data:", common.HumanFileSize(int64(len(edata))), "| MD5 Hash:", common.MD5Hash(edata))
 
-	enc, err := reedsolomon.New(100, 25)
+	enc, err := reedsolomon.New(shards, parity)
 	if err != nil {
 		return err
 	}
@@ -349,7 +356,7 @@ type dFrame struct {
 	position int
 }
 
-func decryptMKVToFile(inputMKV, outputFile string, key []byte, chunkSize int, cores int) error {
+func decryptMKVToFile(inputMKV, outputFile string, key []byte, chunkSize int, cores int, shards, parity int) error {
 
 	inputVideo, err := gocv.VideoCaptureFile(inputMKV)
 	if err != nil {
@@ -432,8 +439,8 @@ func decryptMKVToFile(inputMKV, outputFile string, key []byte, chunkSize int, co
 
 	fmt.Println("\nSize of encoded data:", common.HumanFileSize(int64(len(chunks))), "MD5:", common.MD5Hash(chunks))
 
-	var ecShards = make([][]byte, 125)
-	var shardSize = len(chunks) / 125
+	var ecShards = make([][]byte, parity+shards)
+	var shardSize = len(chunks) / (parity + shards)
 	for i := range ecShards {
 		start := i * shardSize
 		end := start + shardSize
@@ -445,7 +452,7 @@ func decryptMKVToFile(inputMKV, outputFile string, key []byte, chunkSize int, co
 	}
 
 	// Create a Reed-Solomon decoder
-	dec, err := reedsolomon.New(100, 25)
+	dec, err := reedsolomon.New(shards, parity)
 	if err != nil {
 		return fmt.Errorf("Error creating Reed-Solomon decoder: %v", err)
 	}
@@ -472,7 +479,7 @@ func decryptMKVToFile(inputMKV, outputFile string, key []byte, chunkSize int, co
 
 	// Join the shards into a single data slice
 	var buf bytes.Buffer
-	err = dec.Join(&buf, ecShards, (100 * shardSize))
+	err = dec.Join(&buf, ecShards, (shards * shardSize))
 	if err != nil {
 		return err
 	}

@@ -132,13 +132,19 @@ type eFrame struct {
 
 func encryptFileToMKV(inputFile, inputMKV, outputFile string, key []byte, chunkSize int, cores int, truncate bool, shards, parity int) error {
 	// Read the input file
-	content, err := os.ReadFile(inputFile)
+	content, err := os.Open(inputFile)
 	if err != nil {
 		return err
 	}
+	inputSize, _ := content.Stat()
+
+	fmt.Println("Size of input file:", common.HumanFileSize(int64(inputSize.Size())))
+
+	compressedBuff := bytes.NewBuffer(nil)
+	common.ZstdCompressReader(content, compressedBuff)
 
 	// Encrypt the content
-	edata, err := encryption.Encrypt(key, content)
+	edata, err := encryption.Encrypt(key, compressedBuff.Bytes())
 	if err != nil {
 		return err
 	}
@@ -500,6 +506,14 @@ func decryptMKVToFile(inputMKV, outputFile string, key []byte, chunkSize int, co
 	if err != nil {
 		return err
 	}
+
+	// Decompress the data
+	decompressedBuff := bytes.NewBuffer(nil)
+	err = common.ZstdDecompressReader(bytes.NewBuffer(data), decompressedBuff)
+	if err != nil {
+		return err
+	}
+	fmt.Println("Size of decompressed data:", common.HumanFileSize(int64(decompressedBuff.Len())))
 
 	// Write the decrypted data to the output file
 	err = os.WriteFile(outputFile, data, 0644)

@@ -3,7 +3,6 @@ package main
 import (
 	"bfg9k/common"
 	"bfg9k/encryption"
-	"bufio"
 	"bytes"
 	"flag"
 	"fmt"
@@ -60,6 +59,9 @@ func main() {
 
 	if *inputFile == "" {
 		fmt.Println("Input file is required!")
+		os.Exit(1)
+	} else if _, err := os.Stat(*inputFile); os.IsNotExist(err) {
+		fmt.Println("Input file does not exist!")
 		os.Exit(1)
 	}
 
@@ -531,6 +533,9 @@ func encryptFileToImage(inputFile, inputImage, outputFile string, key []byte) er
 		return err
 	}
 
+	compressedBuff := bytes.NewBuffer(nil)
+	common.ZstdCompressReader(bytes.NewReader(content), compressedBuff)
+
 	victimImage, err := os.Open(inputImage)
 	if err != nil {
 		return err
@@ -538,7 +543,7 @@ func encryptFileToImage(inputFile, inputImage, outputFile string, key []byte) er
 	defer victimImage.Close()
 
 	// Encrypt the content
-	edata, err := encryption.Encrypt(key, content)
+	edata, err := encryption.Encrypt(key, compressedBuff.Bytes())
 	if err != nil {
 		return err
 	}
@@ -572,9 +577,11 @@ func decryptImageToFile(inputImage, outputFile string, key []byte) error {
 	}
 	defer victimImage.Close()
 
+	decompressedBuff := bytes.NewBuffer(nil)
+	common.ZstdDecompressReader(victimImage, decompressedBuff)
+
 	// Decode the data from the image
-	reader := bufio.NewReader(victimImage)
-	dvi, err := png.Decode(reader)
+	dvi, err := png.Decode(decompressedBuff)
 	if err != nil {
 		return err
 	}

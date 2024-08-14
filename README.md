@@ -18,8 +18,8 @@ Below is a example of what steganography looks in a image. The left image is the
             <td>Encoded</td>
       </tr>
       <tr>
-            <td><img src="./Cover-Original.png" height=750></td>
-            <td><img src="./Cover-Stego.png" height=750></td>
+            <td><img src="./Cover-Original.png" ></td>
+            <td><img src="./Cover-Stego.png"></td>
       </tr>
 </table>
 

@@ -1,4 +1,4 @@
-module bfg9k
+module github.com/JustinTimperio/bfg9k
 
 go 1.22.6
 
